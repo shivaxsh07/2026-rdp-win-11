@@ -1,148 +1,59 @@
-name: kali linux rdp
+name: ssh tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  kali-rdp:
+  ssh-session:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     env:
-      RDP_USER: sivnsh7
-      RDP_PASS: root
+      SSH_USER: sivnsh7
+      SSH_PASS: root
 
     steps:
 
-      - name: Install XFCE + XRDP + SSH
+      - name: Install OpenSSH
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            dbus-x11 \
-            netcat-openbsd \
-            xorgxrdp \
-            xrdp \
-            xfce4 \
-            xfce4-terminal \
-            xfce4-goodies \
-            xfconf \
-            xfce4-session \
-            x11-xserver-utils \
-            pulseaudio \
-            openssh-server
+          sudo apt-get install -y openssh-server
 
-      - name: Configure SSH
+      - name: Create User and Configure SSH
         shell: bash
         run: |
           set -euo pipefail
 
-          # Allow password auth — disabled by default on Ubuntu
+          # Create user
+          sudo useradd --create-home --shell /bin/bash "$SSH_USER" || true
+          printf '%s:%s\n' "$SSH_USER" "$SSH_PASS" | sudo chpasswd
+          sudo usermod -aG sudo "$SSH_USER"
+          echo "$SSH_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
+
+          # Enable password login
           sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-
-          # Allow our user through PAM
           sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
 
-          # Lock SSH to Tailscale interface only for security
-          # This gets updated after Tailscale is up
-          echo "ListenAddress 0.0.0.0" | sudo tee -a /etc/ssh/sshd_config
-
-          # Enable + start SSH now and on every boot
+          # Start SSH
           sudo systemctl enable ssh
-          sudo systemctl start ssh
-          sudo systemctl status ssh --no-pager || true
+          sudo systemctl restart ssh
 
-          echo "SSH configured and running on port 22"
-
-      - name: Create User and Fix Session Startup
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo useradd --create-home --shell /bin/bash "$RDP_USER" || true
-          printf '%s:%s\n' "$RDP_USER" "$RDP_PASS" | sudo chpasswd
-          sudo usermod -aG sudo "$RDP_USER"
-          echo "$RDP_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
-
-          # Create .ssh dir for key auth if ever needed
-          sudo mkdir -p "/home/$RDP_USER/.ssh"
-          sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.ssh"
-          sudo chmod 700 "/home/$RDP_USER/.ssh"
-
-          # XFCE session fix — dbus-launch prevents the failsafe error
-          sudo tee "/home/$RDP_USER/.xsession" > /dev/null << 'XSESSION'
-#!/bin/bash
-export XDG_CONFIG_DIRS=/etc/xdg
-export XDG_CONFIG_HOME=$HOME/.config
-export XDG_DATA_DIRS=/usr/local/share:/usr/share
-unset DBUS_SESSION_BUS_ADDRESS
-exec dbus-launch --exit-with-session startxfce4
-XSESSION
-          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
-          sudo chmod 0700 "/home/$RDP_USER/.xsession"
-
-          # Override XRDP startwm.sh
-          sudo tee /etc/xrdp/startwm.sh > /dev/null << 'STARTWM'
-#!/bin/sh
-export XDG_CONFIG_DIRS=/etc/xdg
-export XDG_CONFIG_HOME=$HOME/.config
-export XDG_DATA_DIRS=/usr/local/share:/usr/share
-unset DBUS_SESSION_BUS_ADDRESS
-exec dbus-launch --exit-with-session startxfce4
-STARTWM
-          sudo chmod +x /etc/xrdp/startwm.sh
-
-          # Polkit fix
-          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
-          printf '%s\n' \
-            '[Allow Colord]' \
-            'Identity=unix-user:*' \
-            'Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile' \
-            'ResultAny=no' \
-            'ResultInactive=no' \
-            'ResultActive=yes' \
-            | sudo tee /etc/polkit-1/localauthority/50-local.d/45-colord.pkla > /dev/null
-
-      - name: Configure and Start XRDP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
-          sudo sed -i 's/max_bpp=32/max_bpp=128/' /etc/xrdp/xrdp.ini
-          sudo adduser xrdp ssl-cert || true
-
-          sudo systemctl enable --now xrdp
-          sudo systemctl enable --now dbus
-
-          ready=0
-          for _ in {1..30}; do
-            if nc -z -w 2 127.0.0.1 3389; then
-              ready=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [[ "$ready" -ne 1 ]]; then
-            echo "XRDP never bound port 3389" >&2
-            sudo systemctl status xrdp --no-pager || true
-            sudo journalctl -u xrdp -n 100 --no-pager || true
-            exit 1
-          fi
-
-          echo "XRDP confirmed on port 3389"
+          # Verify port 22 is open
+          sleep 3
+          nc -z -w 5 127.0.0.1 22 \
+            && echo "SSH up on port 22" \
+            || { echo "SSH failed to start" >&2; exit 1; }
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: kali-rdp-${{ github.run_id }}
+          hostname: ssh-${{ github.run_id }}
 
-      - name: Lock SSH to Tailscale IP and Restart
+      - name: Get IP and Print SSH Command
         shell: bash
         run: |
           set -euo pipefail
@@ -150,58 +61,26 @@ STARTWM
           TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TAILSCALE_IP" ]]; then
-            echo "No Tailscale IP — check TAILSCALE_AUTHKEY secret" >&2
+            echo "No Tailscale IP — is TAILSCALE_AUTHKEY set?" >&2
             exit 1
           fi
 
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
-
-          # Now restrict SSH to only listen on Tailscale interface
-          sudo sed -i "s/^ListenAddress 0.0.0.0/ListenAddress $TAILSCALE_IP/" /etc/ssh/sshd_config
-
-          # Restart SSH with new bind address
-          sudo systemctl restart ssh
-          sudo systemctl status ssh --no-pager || true
-
-          # Verify SSH is up on Tailscale IP
-          nc -z -w 5 "$TAILSCALE_IP" 22 \
-            && echo "SSH confirmed on $TAILSCALE_IP:22" \
-            || echo "SSH port check failed — may still be binding"
-
-      - name: Print Creds
-        shell: bash
-        run: |
           echo ""
           echo "==============================="
-          echo "     KALI LINUX RDP + SSH      "
+          echo "        SSH READY              "
           echo "==============================="
-          echo "  Host : $TAILSCALE_IP"
-          echo ""
-          echo "  [RDP]"
-          echo "  Port : 3389"
-          echo "  User : $RDP_USER"
-          echo "  Pass : $RDP_PASS"
-          echo ""
-          echo "  [SSH]"
-          echo "  Port : 22"
-          echo "  User : $RDP_USER"
-          echo "  Pass : $RDP_PASS"
-          echo "  CMD  : ssh $RDP_USER@$TAILSCALE_IP"
+          echo "  ssh $SSH_USER@$TAILSCALE_IP"
+          echo "  Password : $SSH_PASS"
           echo "==============================="
           echo ""
 
       - name: Keep Runner Alive
         shell: bash
         run: |
-          echo "Runner live until timeout or manual cancel."
           while sleep 300; do
-            if ! systemctl is-active --quiet xrdp; then
-              echo "XRDP stopped" >&2
-              exit 1
-            fi
             if ! systemctl is-active --quiet ssh; then
-              echo "SSH stopped — restarting..." >&2
+              echo "SSH dropped — restarting..." >&2
               sudo systemctl restart ssh
             fi
-            echo "[$(date '+%H:%M:%S')] RDP + SSH active..."
+            echo "[$(date '+%H:%M:%S')] SSH active..."
           done
