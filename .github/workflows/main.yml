@@ -1,180 +1,127 @@
-name: kali linux
+name: Temporary XFCE desktop over Tailscale
 
 on:
   workflow_dispatch:
-  # Manual trigger ONLY — go to Actions tab and click "Run workflow"
-  # Pushing to repo will NOT trigger this
 
 jobs:
-  kali-rdp:
-    runs-on: ubuntu-latest
-    # GitHub has no Kali runner so we use Ubuntu as the base OS
-    # We install Kali packages on top of it
+  desktop:
+    runs-on: ubuntu-26.04
     timeout-minutes: 350
-    # Keeps the runner alive for up to 350 minutes (GitHub max is 360)
+
+    # GitHub issues a short-lived OIDC token for Tailscale authentication.
+    permissions:
+      id-token: write
+
+    env:
+      RDP_USER: sivnsh7
 
     steps:
-
-      - name: Add Kali Repository
+      - name: Install XFCE and XRDP
+        shell: bash
         run: |
-          # Step 1 — Tell apt WHERE to find Kali packages
-          echo "deb http://http.kali.org/kali kali-rolling main non-free contrib" \
-            | sudo tee /etc/apt/sources.list.d/kali.list
-          # kali-rolling = latest rolling release packages
-          # main non-free contrib = all package categories
+          set -euo pipefail
 
-          # Step 2 — Import Kali's GPG signing key
-          # Without this apt will REFUSE to trust the Kali repo
-          wget -q -O - https://archive.kali.org/archive-key.asc | sudo apt-key add -
-
-          # Step 3 — Refresh apt's package index with Kali repo now added
-          sudo apt-get update -y
-
-      - name: Install Kali Desktop + XRDP
-        run: |
-          # DEBIAN_FRONTEND=noninteractive = skip all "press Y to continue" prompts
-          # Otherwise the install hangs waiting for input nobody types
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            kali-desktop-xfce \
-            # Kali's official XFCE desktop — lightweight, runs well on a runner
-            xrdp \
-            # The actual RDP server — this is what your RDP client connects to
-            xfce4 \
-            # XFCE desktop environment core
-            xfce4-terminal \
-            # Terminal emulator inside the desktop
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
             dbus-x11 \
-            # D-Bus X11 bridge — desktop sessions NEED this or they won't start
-            x11-xserver-utils
-            # X11 tools — needed for display resolution and screen setup
+            netcat-openbsd \
+            xorgxrdp \
+            xrdp \
+            xfce4 \
+            xfce4-terminal
 
-      - name: Create User sivnsh7
+      - name: Create temporary RDP login and configure XFCE
+        shell: bash
         run: |
-          # Create user sivnsh7 with a home directory (-m) and bash as their shell (-s)
-          # The "|| true" means: if user already exists, don't crash — just move on
-          sudo useradd -m -s /bin/bash sivnsh7 || true
+          set -euo pipefail
 
-          # Set the password to "root"
-          # chpasswd reads "username:password" from stdin — cleanest way to do it
-          echo "sivnsh7:root" | sudo chpasswd
+          # Fresh random password for this run; it is not hard-coded.
+          RDP_PASSWORD="$(openssl rand -hex 18)"
 
-          # Add sivnsh7 to the sudo group so they have admin rights inside the session
-          sudo usermod -aG sudo sivnsh7
+          sudo useradd --create-home --shell /bin/bash "$RDP_USER"
+          printf '%s:%s\n' "$RDP_USER" "$RDP_PASSWORD" | sudo chpasswd
 
-          # Give passwordless sudo — some desktop actions silently need sudo
-          # Without this you get frozen auth popups mid-session
-          echo "sivnsh7 ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
+          printf '%s\n' 'xfce4-session' \
+            | sudo tee "/home/$RDP_USER/.xsession" >/dev/null
+          sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
+          sudo chmod 0700 "/home/$RDP_USER/.xsession"
 
-      - name: Configure XRDP to Launch XFCE
+          # Available to later steps in this job only; it is not permanent storage.
+          printf 'RDP_PASSWORD=%s\n' "$RDP_PASSWORD" >> "$GITHUB_ENV"
+          unset RDP_PASSWORD
+
+      - name: Start XRDP and check the local listener
+        shell: bash
         run: |
-          # This file tells XRDP which desktop to launch when sivnsh7 logs in
-          # Without .xsession XRDP connects but shows a BLANK black screen
-          echo "startxfce4" | sudo tee /home/sivnsh7/.xsession
+          set -euo pipefail
 
-          # Fix ownership — the file must belong to sivnsh7 not root
-          sudo chown sivnsh7:sivnsh7 /home/sivnsh7/.xsession
+          sudo systemctl enable --now xrdp
 
-          # Make it executable — XRDP runs it as a script
-          sudo chmod +x /home/sivnsh7/.xsession
-
-          # Set the RDP listening port to 3389 (standard RDP port clients expect)
-          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
-
-          # Bump color depth — better visuals over the RDP connection
-          sudo sed -i 's/max_bpp=32/max_bpp=128/' /etc/xrdp/xrdp.ini
-
-          # Polkit fix — this is a VERY common XRDP gotcha
-          # Without it a color manager auth popup appears and FREEZES the session
-          sudo bash -c 'cat > /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla <<EOF
-[Allow Colord all Users]
-Identity=unix-user:*
-Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
-ResultAny=no
-ResultInactive=no
-ResultActive=yes
-EOF'
-
-          # Enable XRDP so it auto-starts (good practice)
-          sudo systemctl enable xrdp
-
-          # Start XRDP right now
-          sudo systemctl start xrdp
-
-          # Give XRDP 4 seconds to fully initialize before we check it
-          sleep 4
-
-          # Print XRDP status — the "|| true" stops a non-zero exit from killing the job
-          sudo systemctl status xrdp --no-pager || true
-
-      - name: Install Tailscale
-        run: |
-          # Tailscale's official installer handles everything:
-          # repo setup, GPG keys, apt install — one line does it all
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-      - name: Connect to Tailscale Network
-        run: |
-          # --authkey: your secret from tailscale.com/settings/keys
-          #            stored in repo Settings → Secrets → TAILSCALE_AUTHKEY
-          # --hostname: gives this runner a name you can see in Tailscale admin panel
-          # --accept-routes: lets this machine use subnet routes from your network
-          # --accept-dns=false: skip Tailscale DNS so apt/curl still work normally
-          sudo tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTHKEY }} \
-            --hostname=kali-$GITHUB_RUN_ID \
-            --accept-routes \
-            --accept-dns=false
-
-          # Poll until Tailscale assigns an IPv4 address
-          # Sometimes it takes a few seconds after "up" runs
-          TSIP=""
-          RETRIES=0
-          while [ -z "$TSIP" ] && [ $RETRIES -lt 15 ]; do
-            # "tailscale ip -4" returns the IPv4 — empty string if not ready yet
-            TSIP=$(sudo tailscale ip -4 2>/dev/null || true)
-            sleep 5
-            RETRIES=$((RETRIES + 1))
+          ready=0
+          for _ in {1..30}; do
+            if nc -z -w 2 127.0.0.1 3389; then
+              ready=1
+              break
+            fi
+            sleep 1
           done
-          # 15 retries × 5 seconds = 75 seconds max wait
 
-          # If after 75 seconds still no IP — auth key is wrong or Tailscale is down
-          if [ -z "$TSIP" ]; then
-            echo "ERROR: No Tailscale IP after 75s. Is TAILSCALE_AUTHKEY set correctly?"
+          if [[ "$ready" -ne 1 ]]; then
+            echo "XRDP did not start listening on port 3389." >&2
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 80 --no-pager || true
             exit 1
           fi
 
-          # Write the IP to GITHUB_ENV so all future steps can read it as $TAILSCALE_IP
-          echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV
-          echo "Tailscale IP assigned: $TSIP"
+      - name: Connect this runner to Tailscale
+        uses: tailscale/github-action@v4.2.0
+        with:
+          # Replace these two non-secret placeholders with the values from
+          # your Tailscale federated identity configuration.
+          oauth-client-id: "REPLACE_WITH_TAILSCALE_CLIENT_ID"
+          audience: "REPLACE_WITH_TAILSCALE_AUDIENCE"
+          tags: tag:ci
+          hostname: rdp-${{ github.run_id }}
+          version: latest
 
-      - name: Verify RDP Port is Open
+      - name: Get the Tailscale address and show connection details
+        shell: bash
         run: |
-          echo "Checking port 3389 on $TAILSCALE_IP..."
+          set -euo pipefail
 
-          # nc -zv = netcat in scan mode, verbose output
-          # This confirms XRDP is actually accepting connections before we print creds
-          nc -zv "$TAILSCALE_IP" 3389 \
-            && echo "Port 3389 OPEN — RDP is live and ready." \
-            || echo "Port 3389 not responding — XRDP may still be starting up."
+          TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
+          if [[ -z "$TAILSCALE_IP" ]]; then
+            echo "Tailscale did not assign an IPv4 address." >&2
+            sudo tailscale status || true
+            exit 1
+          fi
 
-      - name: Print Creds and Hold Runner Alive
+          printf 'TAILSCALE_IP=%s\n' "$TAILSCALE_IP" >> "$GITHUB_ENV"
+
+          {
+            printf '## Temporary RDP desktop\n\n'
+            printf '%s\n' 'Use an RDP client on a device allowed by your Tailscale access policy.'
+            printf '%s\n\n' '- Desktop: Ubuntu XFCE'
+            printf '%s\n' "- Host: \`$TAILSCALE_IP\`"
+            printf '%s\n' '- Port: `3389`'
+            printf '%s\n' "- Username: \`$RDP_USER\`"
+            printf '%s\n' "- Password: \`$RDP_PASSWORD\`"
+            printf '\n%s\n' 'This password and runner are temporary. The password is visible to people who can read this repository’s Actions run.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Connection details are in this run's Actions job summary."
+
+      - name: Keep the temporary desktop running
+        shell: bash
         run: |
-          echo ""
-          echo "==============================="
-          echo "   KALI LINUX RDP READY"
-          echo "==============================="
-          echo "  Host : $TAILSCALE_IP"
-          echo "  Port : 3389"
-          echo "  User : sivnsh7"
-          echo "  Pass : root"
-          echo "==============================="
-          echo ""
+          set -euo pipefail
 
-          # Infinite loop — keeps the GitHub Actions runner alive
-          # Without this the job finishes instantly and your RDP session dies
-          # Runner stays up until the 350 minute timeout kills it
-          while true; do
-            echo "[$(date '+%H:%M:%S')] Kali RDP running — session active..."
-            sleep 300
-            # Prints a heartbeat every 5 minutes so GitHub knows the job is still alive
+          echo "The runner will stop when this workflow is cancelled or reaches its timeout."
+          while sleep 300; do
+            if ! systemctl is-active --quiet xrdp; then
+              echo "XRDP stopped unexpectedly." >&2
+              sudo systemctl status xrdp --no-pager || true
+              exit 1
+            fi
+            echo "XRDP is still running."
           done
