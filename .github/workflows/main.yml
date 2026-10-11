@@ -26,9 +26,13 @@ jobs:
             xrdp \
             xfce4 \
             xfce4-terminal \
-            xfce4-goodies
+            xfce4-goodies \
+            xfconf \
+            xfce4-session \
+            x11-xserver-utils \
+            pulseaudio
 
-      - name: Create User and Configure Desktop
+      - name: Create User and Fix Session Startup
         shell: bash
         run: |
           set -euo pipefail
@@ -38,10 +42,33 @@ jobs:
           sudo usermod -aG sudo "$RDP_USER"
           echo "$RDP_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
 
-          echo 'xfce4-session' | sudo tee "/home/$RDP_USER/.xsession" > /dev/null
+          # THE FIX — startxfce4 (not xfce4-session) WITH proper env vars
+          # xfce4-session alone inside XRDP never gets a D-Bus session
+          # XDG_CONFIG_DIRS must include /etc or xfconfd dies instantly
+          sudo tee "/home/$RDP_USER/.xsession" > /dev/null << 'XSESSION'
+          #!/bin/bash
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_CONFIG_HOME=$HOME/.config
+          export XDG_DATA_DIRS=/usr/local/share:/usr/share
+          unset DBUS_SESSION_BUS_ADDRESS
+          exec dbus-launch --exit-with-session startxfce4
+          XSESSION
+
           sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
           sudo chmod 0700 "/home/$RDP_USER/.xsession"
 
+          # Override XRDP's own startwm.sh to also use startxfce4
+          sudo tee /etc/xrdp/startwm.sh > /dev/null << 'STARTWM'
+          #!/bin/sh
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_CONFIG_HOME=$HOME/.config
+          export XDG_DATA_DIRS=/usr/local/share:/usr/share
+          unset DBUS_SESSION_BUS_ADDRESS
+          exec dbus-launch --exit-with-session startxfce4
+          STARTWM
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Polkit fix — stops colour-manager popup freezing the session
           sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
           printf '%s\n' \
             '[Allow Colord]' \
@@ -52,12 +79,24 @@ jobs:
             'ResultActive=yes' \
             | sudo tee /etc/polkit-1/localauthority/50-local.d/45-colord.pkla > /dev/null
 
-      - name: Start XRDP and Verify Port 3389
+      - name: Configure and Start XRDP
         shell: bash
         run: |
           set -euo pipefail
-          sudo systemctl enable --now xrdp
 
+          # Make sure xrdp uses port 3389
+          sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
+
+          # Bump colour depth
+          sudo sed -i 's/max_bpp=32/max_bpp=128/' /etc/xrdp/xrdp.ini
+
+          # Add xrdp user to ssl-cert group (needed on some Ubuntu versions)
+          sudo adduser xrdp ssl-cert || true
+
+          sudo systemctl enable --now xrdp
+          sudo systemctl enable --now dbus
+
+          # Wait up to 60s for port 3389 to open
           ready=0
           for _ in {1..30}; do
             if nc -z -w 2 127.0.0.1 3389; then
@@ -68,13 +107,13 @@ jobs:
           done
 
           if [[ "$ready" -ne 1 ]]; then
-            echo "XRDP failed to bind port 3389" >&2
+            echo "XRDP never bound port 3389" >&2
             sudo systemctl status xrdp --no-pager || true
             sudo journalctl -u xrdp -n 100 --no-pager || true
             exit 1
           fi
 
-          echo "XRDP confirmed on port 3389"
+          echo "XRDP confirmed listening on 3389"
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
@@ -82,16 +121,14 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: kali-rdp-${{ github.run_id }}
 
-      - name: Get Tailscale IP and Print Creds
+      - name: Print Creds
         shell: bash
         run: |
           set -euo pipefail
-
           TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TAILSCALE_IP" ]]; then
-            echo "No Tailscale IP — is TAILSCALE_AUTHKEY set in repo secrets?" >&2
-            sudo tailscale status || true
+            echo "No Tailscale IP — check TAILSCALE_AUTHKEY secret" >&2
             exit 1
           fi
 
@@ -112,9 +149,9 @@ jobs:
           echo "Runner live until timeout or manual cancel."
           while sleep 300; do
             if ! systemctl is-active --quiet xrdp; then
-              echo "XRDP dropped unexpectedly" >&2
+              echo "XRDP stopped" >&2
               sudo systemctl status xrdp --no-pager || true
               exit 1
             fi
-            echo "[$(date '+%H:%M:%S')] Session still active..."
+            echo "[$(date '+%H:%M:%S')] Session active..."
           done
