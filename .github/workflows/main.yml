@@ -14,7 +14,7 @@ jobs:
 
     steps:
 
-      - name: Install XFCE and XRDP
+      - name: Install XFCE + XRDP + SSH
         shell: bash
         run: |
           set -euo pipefail
@@ -30,7 +30,32 @@ jobs:
             xfconf \
             xfce4-session \
             x11-xserver-utils \
-            pulseaudio
+            pulseaudio \
+            openssh-server
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Allow password auth — disabled by default on Ubuntu
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+          # Allow our user through PAM
+          sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+
+          # Lock SSH to Tailscale interface only for security
+          # This gets updated after Tailscale is up
+          echo "ListenAddress 0.0.0.0" | sudo tee -a /etc/ssh/sshd_config
+
+          # Enable + start SSH now and on every boot
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          sudo systemctl status ssh --no-pager || true
+
+          echo "SSH configured and running on port 22"
 
       - name: Create User and Fix Session Startup
         shell: bash
@@ -42,33 +67,35 @@ jobs:
           sudo usermod -aG sudo "$RDP_USER"
           echo "$RDP_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
 
-          # THE FIX — startxfce4 (not xfce4-session) WITH proper env vars
-          # xfce4-session alone inside XRDP never gets a D-Bus session
-          # XDG_CONFIG_DIRS must include /etc or xfconfd dies instantly
-          sudo tee "/home/$RDP_USER/.xsession" > /dev/null << 'XSESSION'
-          #!/bin/bash
-          export XDG_CONFIG_DIRS=/etc/xdg
-          export XDG_CONFIG_HOME=$HOME/.config
-          export XDG_DATA_DIRS=/usr/local/share:/usr/share
-          unset DBUS_SESSION_BUS_ADDRESS
-          exec dbus-launch --exit-with-session startxfce4
-          XSESSION
+          # Create .ssh dir for key auth if ever needed
+          sudo mkdir -p "/home/$RDP_USER/.ssh"
+          sudo chown -R "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.ssh"
+          sudo chmod 700 "/home/$RDP_USER/.ssh"
 
+          # XFCE session fix — dbus-launch prevents the failsafe error
+          sudo tee "/home/$RDP_USER/.xsession" > /dev/null << 'XSESSION'
+#!/bin/bash
+export XDG_CONFIG_DIRS=/etc/xdg
+export XDG_CONFIG_HOME=$HOME/.config
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+unset DBUS_SESSION_BUS_ADDRESS
+exec dbus-launch --exit-with-session startxfce4
+XSESSION
           sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
           sudo chmod 0700 "/home/$RDP_USER/.xsession"
 
-          # Override XRDP's own startwm.sh to also use startxfce4
+          # Override XRDP startwm.sh
           sudo tee /etc/xrdp/startwm.sh > /dev/null << 'STARTWM'
-          #!/bin/sh
-          export XDG_CONFIG_DIRS=/etc/xdg
-          export XDG_CONFIG_HOME=$HOME/.config
-          export XDG_DATA_DIRS=/usr/local/share:/usr/share
-          unset DBUS_SESSION_BUS_ADDRESS
-          exec dbus-launch --exit-with-session startxfce4
-          STARTWM
+#!/bin/sh
+export XDG_CONFIG_DIRS=/etc/xdg
+export XDG_CONFIG_HOME=$HOME/.config
+export XDG_DATA_DIRS=/usr/local/share:/usr/share
+unset DBUS_SESSION_BUS_ADDRESS
+exec dbus-launch --exit-with-session startxfce4
+STARTWM
           sudo chmod +x /etc/xrdp/startwm.sh
 
-          # Polkit fix — stops colour-manager popup freezing the session
+          # Polkit fix
           sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
           printf '%s\n' \
             '[Allow Colord]' \
@@ -84,19 +111,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Make sure xrdp uses port 3389
           sudo sed -i 's/^port=.*/port=3389/' /etc/xrdp/xrdp.ini
-
-          # Bump colour depth
           sudo sed -i 's/max_bpp=32/max_bpp=128/' /etc/xrdp/xrdp.ini
-
-          # Add xrdp user to ssl-cert group (needed on some Ubuntu versions)
           sudo adduser xrdp ssl-cert || true
 
           sudo systemctl enable --now xrdp
           sudo systemctl enable --now dbus
 
-          # Wait up to 60s for port 3389 to open
           ready=0
           for _ in {1..30}; do
             if nc -z -w 2 127.0.0.1 3389; then
@@ -113,7 +134,7 @@ jobs:
             exit 1
           fi
 
-          echo "XRDP confirmed listening on 3389"
+          echo "XRDP confirmed on port 3389"
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
@@ -121,10 +142,11 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: kali-rdp-${{ github.run_id }}
 
-      - name: Print Creds
+      - name: Lock SSH to Tailscale IP and Restart
         shell: bash
         run: |
           set -euo pipefail
+
           TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TAILSCALE_IP" ]]; then
@@ -132,14 +154,39 @@ jobs:
             exit 1
           fi
 
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
+
+          # Now restrict SSH to only listen on Tailscale interface
+          sudo sed -i "s/^ListenAddress 0.0.0.0/ListenAddress $TAILSCALE_IP/" /etc/ssh/sshd_config
+
+          # Restart SSH with new bind address
+          sudo systemctl restart ssh
+          sudo systemctl status ssh --no-pager || true
+
+          # Verify SSH is up on Tailscale IP
+          nc -z -w 5 "$TAILSCALE_IP" 22 \
+            && echo "SSH confirmed on $TAILSCALE_IP:22" \
+            || echo "SSH port check failed — may still be binding"
+
+      - name: Print Creds
+        shell: bash
+        run: |
           echo ""
           echo "==============================="
-          echo "     KALI LINUX RDP READY      "
+          echo "     KALI LINUX RDP + SSH      "
           echo "==============================="
           echo "  Host : $TAILSCALE_IP"
+          echo ""
+          echo "  [RDP]"
           echo "  Port : 3389"
           echo "  User : $RDP_USER"
           echo "  Pass : $RDP_PASS"
+          echo ""
+          echo "  [SSH]"
+          echo "  Port : 22"
+          echo "  User : $RDP_USER"
+          echo "  Pass : $RDP_PASS"
+          echo "  CMD  : ssh $RDP_USER@$TAILSCALE_IP"
           echo "==============================="
           echo ""
 
@@ -150,8 +197,11 @@ jobs:
           while sleep 300; do
             if ! systemctl is-active --quiet xrdp; then
               echo "XRDP stopped" >&2
-              sudo systemctl status xrdp --no-pager || true
               exit 1
             fi
-            echo "[$(date '+%H:%M:%S')] Session active..."
+            if ! systemctl is-active --quiet ssh; then
+              echo "SSH stopped — restarting..." >&2
+              sudo systemctl restart ssh
+            fi
+            echo "[$(date '+%H:%M:%S')] RDP + SSH active..."
           done
