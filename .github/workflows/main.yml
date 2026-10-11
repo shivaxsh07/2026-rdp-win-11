@@ -8,17 +8,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
-    permissions:
-      id-token: write
-      contents: read
-
     env:
       RDP_USER: sivnsh7
       RDP_PASS: root
 
     steps:
 
-      - name: Install XFCE + XRDP
+      - name: Install XFCE and XRDP
         shell: bash
         run: |
           set -euo pipefail
@@ -32,42 +28,34 @@ jobs:
             xfce4-terminal \
             xfce4-goodies
 
-      - name: Create User sivnsh7 with password root
+      - name: Create User and Configure Desktop
         shell: bash
         run: |
           set -euo pipefail
 
           sudo useradd --create-home --shell /bin/bash "$RDP_USER" || true
           printf '%s:%s\n' "$RDP_USER" "$RDP_PASS" | sudo chpasswd
-
-          # Add to sudo group
           sudo usermod -aG sudo "$RDP_USER"
-
-          # Passwordless sudo inside session
           echo "$RDP_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
 
-          # Tell XRDP to launch XFCE on login
-          echo 'xfce4-session' \
-            | sudo tee "/home/$RDP_USER/.xsession" > /dev/null
+          echo 'xfce4-session' | sudo tee "/home/$RDP_USER/.xsession" > /dev/null
           sudo chown "$RDP_USER:$RDP_USER" "/home/$RDP_USER/.xsession"
           sudo chmod 0700 "/home/$RDP_USER/.xsession"
 
-          # Fix the colour-manager auth popup that freezes XRDP sessions
           sudo mkdir -p /etc/polkit-1/localauthority/50-local.d
-          sudo bash -c 'cat > /etc/polkit-1/localauthority/50-local.d/45-colord.pkla <<EOF
-[Allow Colord]
-Identity=unix-user:*
-Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile
-ResultAny=no
-ResultInactive=no
-ResultActive=yes
-EOF'
+          printf '%s\n' \
+            '[Allow Colord]' \
+            'Identity=unix-user:*' \
+            'Action=org.freedesktop.color-manager.create-device;org.freedesktop.color-manager.create-profile;org.freedesktop.color-manager.delete-device;org.freedesktop.color-manager.delete-profile;org.freedesktop.color-manager.modify-device;org.freedesktop.color-manager.modify-profile' \
+            'ResultAny=no' \
+            'ResultInactive=no' \
+            'ResultActive=yes' \
+            | sudo tee /etc/polkit-1/localauthority/50-local.d/45-colord.pkla > /dev/null
 
       - name: Start XRDP and Verify Port 3389
         shell: bash
         run: |
           set -euo pipefail
-
           sudo systemctl enable --now xrdp
 
           ready=0
@@ -80,13 +68,13 @@ EOF'
           done
 
           if [[ "$ready" -ne 1 ]]; then
-            echo "XRDP failed to start on port 3389" >&2
+            echo "XRDP failed to bind port 3389" >&2
             sudo systemctl status xrdp --no-pager || true
             sudo journalctl -u xrdp -n 100 --no-pager || true
             exit 1
           fi
 
-          echo "XRDP is up and listening on port 3389"
+          echo "XRDP confirmed on port 3389"
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
@@ -102,34 +90,31 @@ EOF'
           TAILSCALE_IP="$(sudo tailscale ip -4 | head -n 1)"
 
           if [[ -z "$TAILSCALE_IP" ]]; then
-            echo "Tailscale IP not assigned — check your TAILSCALE_AUTHKEY secret" >&2
+            echo "No Tailscale IP — is TAILSCALE_AUTHKEY set in repo secrets?" >&2
             sudo tailscale status || true
             exit 1
           fi
 
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
-
           echo ""
           echo "==============================="
-          echo "      KALI LINUX RDP READY     "
+          echo "     KALI LINUX RDP READY      "
           echo "==============================="
-          echo "  Host     : $TAILSCALE_IP"
-          echo "  Port     : 3389"
-          echo "  Username : $RDP_USER"
-          echo "  Password : $RDP_PASS"
+          echo "  Host : $TAILSCALE_IP"
+          echo "  Port : 3389"
+          echo "  User : $RDP_USER"
+          echo "  Pass : $RDP_PASS"
           echo "==============================="
           echo ""
 
-      - name: Hold Runner Alive
+      - name: Keep Runner Alive
         shell: bash
         run: |
-          echo "Session is live. Runner stays up until timeout or you cancel the workflow."
-
+          echo "Runner live until timeout or manual cancel."
           while sleep 300; do
             if ! systemctl is-active --quiet xrdp; then
-              echo "XRDP stopped unexpectedly" >&2
+              echo "XRDP dropped unexpectedly" >&2
               sudo systemctl status xrdp --no-pager || true
               exit 1
             fi
-            echo "[$(date '+%H:%M:%S')] XRDP still running..."
+            echo "[$(date '+%H:%M:%S')] Session still active..."
           done
